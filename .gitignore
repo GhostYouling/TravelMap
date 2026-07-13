@@ -9,3 +9,5 @@ thumbnails/
 coverage/
 .vinext/
 .wrangler/
+.cache/
+.npm/

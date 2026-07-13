@@ -96,6 +96,8 @@ curl http://127.0.0.1:8787/api/health
 
 正式公网使用前，请为 Nginx 配置 HTTPS（例如 Certbot），并在阿里云安全组只开放 80/443，不开放 8787。
 
+当前阿里云实例使用 `deployment/nginx-ip-https.conf`，通过 Let’s Encrypt 的短期 IP 证书直接为公网 IP 提供 HTTPS；`certbot-ip-renew.timer` 每 8 小时检查续期并在更新后重新加载 Nginx。
+
 ## 数据目录与备份
 
 必须一起备份以下三个目录：
