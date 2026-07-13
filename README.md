@@ -119,6 +119,7 @@ sudo systemctl start jiyu
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PORT` | `8787` | Node 服务端口 |
+| `HOST` | 生产为 `127.0.0.1` | 监听地址；生产环境仅供本机 Nginx 访问 |
 | `SITE_URL` | 自动识别 | 公网地址，用于生成分享图绝对地址 |
 | `DATA_DIR` | `./data` | SQLite 目录 |
 | `UPLOAD_DIR` | `./uploads` | 原媒体目录 |
