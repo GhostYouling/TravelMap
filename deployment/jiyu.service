@@ -8,8 +8,9 @@ User=jiyu
 Group=jiyu
 WorkingDirectory=/opt/jiyu
 Environment=NODE_ENV=production
+Environment=PATH=/opt/node22/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EnvironmentFile=/opt/jiyu/.env
-ExecStart=/usr/bin/node /opt/jiyu/server/index.js
+ExecStart=/usr/bin/env node /opt/jiyu/server/index.js
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
