@@ -11,6 +11,8 @@ import {
   Image as ImageIcon,
   KeyRound,
   LoaderCircle,
+  LockKeyhole,
+  LogOut,
   MapPin,
   Pencil,
   Play,
@@ -23,12 +25,13 @@ import {
 import { api, getAdminToken, saveAdminToken, uploadMedia } from "./api";
 import { TravelGlobe } from "./components/TravelGlobe";
 import { COUNTRIES, countryName, inferCityName, inferCountryCode } from "./locations";
-import type { AppConfig, LocationSuggestion, MediaItem, Totals, Trip, TripInput } from "./types";
+import type { AppConfig, LocationSuggestion, MediaItem, Totals, Trip, TripInput, ViewerSession } from "./types";
 
 const EMPTY_TOTALS: Totals = { tripCount: 0, mediaCount: 0, totalBytes: 0 };
-const EMPTY_CONFIG: AppConfig = { maxUploadMb: 2048, writeProtected: false };
+const EMPTY_CONFIG: AppConfig = { maxUploadMb: 2048, writeProtected: false, viewerAuthEnabled: false };
+const EMPTY_VIEWER_SESSION: ViewerSession = { viewerAuthEnabled: false, authenticated: false };
 
-type Modal = "create" | "edit" | "upload" | "token" | null;
+type Modal = "create" | "edit" | "upload" | "token" | "viewer" | null;
 type UploadState = { name: string; progress: number; status: "waiting" | "uploading" | "done" | "error"; error?: string };
 
 function formatBytes(bytes: number) {
@@ -196,6 +199,7 @@ export function App() {
   const [trips, setTrips] = useState<Trip[]>([]);
   const [totals, setTotals] = useState<Totals>(EMPTY_TOTALS);
   const [config, setConfig] = useState<AppConfig>(EMPTY_CONFIG);
+  const [viewerSession, setViewerSession] = useState<ViewerSession>(EMPTY_VIEWER_SESSION);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [media, setMedia] = useState<MediaItem[]>([]);
   const [mediaPage, setMediaPage] = useState(1);
@@ -208,9 +212,12 @@ export function App() {
   const [uploadQueue, setUploadQueue] = useState<UploadState[]>([]);
   const [toast, setToast] = useState("");
   const [fatalError, setFatalError] = useState("");
+  const [viewerError, setViewerError] = useState("");
+  const [adminError, setAdminError] = useState("");
 
   const selectedTrip = useMemo(() => trips.find((trip) => trip.id === selectedId) || null, [trips, selectedId]);
   const selectedIndex = selectedTrip ? trips.findIndex((trip) => trip.id === selectedTrip.id) : -1;
+  const viewerLocked = config.viewerAuthEnabled && !viewerSession.authenticated;
 
   const refreshTrips = useCallback(async (preferredId?: string) => {
     const result = await api.getTrips();
@@ -236,16 +243,31 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    Promise.all([api.getConfig(), refreshTrips()])
-      .then(([appConfig]) => setConfig(appConfig))
+    Promise.all([api.getConfig(), api.getViewerSession(), refreshTrips()])
+      .then(([appConfig, session]) => {
+        setConfig(appConfig);
+        setViewerSession(session);
+      })
       .catch((error) => setFatalError(error instanceof Error ? error.message : "无法连接服务"))
       .finally(() => setLoading(false));
   }, [refreshTrips]);
 
   useEffect(() => {
-    if (selectedId) loadMedia(selectedId).catch((error) => setToast(error.message));
-    else setMedia([]);
-  }, [selectedId, loadMedia]);
+    if (selectedId && viewerSession.authenticated) {
+      loadMedia(selectedId).catch((error) => {
+        if (error && typeof error === "object" && "status" in error && error.status === 401) {
+          setViewerSession((current) => ({ ...current, authenticated: false }));
+          setMedia([]);
+          setHasMore(false);
+          return;
+        }
+        setToast(error instanceof Error ? error.message : "影像加载失败");
+      });
+    } else {
+      setMedia([]);
+      setHasMore(false);
+    }
+  }, [selectedId, viewerSession.authenticated, loadMedia]);
 
   useEffect(() => {
     if (!toast) return;
@@ -255,8 +277,66 @@ export function App() {
 
   function needToken(error: unknown) {
     if (error && typeof error === "object" && "status" in error && error.status === 401) {
+      setAdminError("");
       setModal("token");
       setToast("请输入管理口令后再试一次");
+    }
+  }
+
+  async function loginViewer(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const token = String(new FormData(event.currentTarget).get("token") || "").trim();
+    setViewerError("");
+    setBusy(true);
+    try {
+      const session = await api.loginViewer(token);
+      setViewerSession(session);
+      setModal(null);
+      setToast("影像已经解锁");
+    } catch (error) {
+      setViewerError(error instanceof Error ? error.message : "登录失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function logoutViewer() {
+    try {
+      const session = await api.logoutViewer();
+      setViewerSession(session);
+      setMedia([]);
+      setHasMore(false);
+      setLightbox(null);
+      setToast("影像已重新上锁");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "退出失败");
+    }
+  }
+
+  async function saveAdminAccess(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const value = String(new FormData(event.currentTarget).get("token") || "").trim();
+    setAdminError("");
+    if (!value) {
+      saveAdminToken("");
+      setModal(null);
+      setToast("已清除管理口令");
+      return;
+    }
+    setBusy(true);
+    try {
+      if (config.viewerAuthEnabled) {
+        const session = await api.loginViewer(value);
+        setViewerSession(session);
+      }
+      saveAdminToken(value);
+      setModal(null);
+      setToast("管理操作和影像查看已解锁");
+    } catch (error) {
+      saveAdminToken("");
+      setAdminError(error instanceof Error ? error.message : "管理口令不正确");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -333,7 +413,9 @@ export function App() {
         if (error && typeof error === "object" && "status" in error && error.status === 401) break;
       }
     }
-    await Promise.all([refreshTrips(selectedTrip.id), loadMedia(selectedTrip.id)]);
+    const refreshes: Promise<unknown>[] = [refreshTrips(selectedTrip.id)];
+    if (viewerSession.authenticated) refreshes.push(loadMedia(selectedTrip.id));
+    await Promise.all(refreshes);
   }
 
   async function deleteMedia(item: MediaItem) {
@@ -368,6 +450,7 @@ export function App() {
           <span><strong>{formatBytes(totals.totalBytes)}</strong> 珍藏</span>
         </div>
         <div className="topbar-actions">
+          {config.viewerAuthEnabled && <button className="key-button" type="button" onClick={() => viewerSession.authenticated ? void logoutViewer() : (setViewerError(""), setModal("viewer"))} aria-label={viewerSession.authenticated ? "退出影像查看" : "登录查看影像"}>{viewerSession.authenticated ? <LogOut size={17} /> : <LockKeyhole size={17} />}<span>{viewerSession.authenticated ? "退出观看" : "查看影像"}</span></button>}
           {config.writeProtected && <button className="key-button" type="button" onClick={() => setModal("token")} aria-label="设置管理口令"><KeyRound size={17} /><span>{getAdminToken() ? "已解锁" : "管理"}</span></button>}
           <button className="button button-primary" type="button" onClick={() => setModal("create")} data-testid="create-trip-button"><Plus size={18} />记录新旅程</button>
         </div>
@@ -411,11 +494,13 @@ export function App() {
               </div>
 
               <div className="gallery-heading">
-                <div><span className="eyebrow">沿途影像</span><h3>{selectedTrip.mediaCount ? `${selectedTrip.mediaCount} 个被留下的瞬间` : "还没有影像"}</h3></div>
-                <div className="gallery-actions"><button className="button button-light" type="button" onClick={() => { setUploadQueue([]); setModal("upload"); }}><UploadCloud size={16} />上传</button>{selectedTrip.mediaCount > 0 && <a className="button button-icon-only" href={`/api/trips/${selectedTrip.id}/download`} aria-label="下载整段旅程"><FileDown size={17} /></a>}</div>
+                <div><span className="eyebrow">沿途影像</span><h3>{viewerLocked ? "登录后查看照片与视频" : selectedTrip.mediaCount ? `${selectedTrip.mediaCount} 个被留下的瞬间` : "还没有影像"}</h3></div>
+                <div className="gallery-actions"><button className="button button-light" type="button" onClick={() => { setUploadQueue([]); setModal("upload"); }}><UploadCloud size={16} />上传</button>{!viewerLocked && selectedTrip.mediaCount > 0 && <a className="button button-icon-only" href={`/api/trips/${selectedTrip.id}/download`} aria-label="下载整段旅程"><FileDown size={17} /></a>}</div>
               </div>
 
-              {media.length ? (
+              {viewerLocked ? (
+                <div className="gallery-locked" data-testid="media-locked"><span className="viewer-lock-symbol"><LockKeyhole size={27} /></span><strong>这段旅程的影像已上锁</strong><small>输入管理口令后，才能查看照片、播放视频或下载原文件。</small><button className="button button-primary" type="button" onClick={() => { setViewerError(""); setModal("viewer"); }}><LockKeyhole size={16} />登录查看影像</button></div>
+              ) : media.length ? (
                 <div className="media-grid" data-testid="media-grid">
                   {media.map((item, index) => (
                     <button className={`media-card media-card-${index % 7 === 0 ? "wide" : "normal"}`} type="button" key={item.id} onClick={() => setLightbox(item)} aria-label={`打开 ${item.originalName}`}>
@@ -451,8 +536,15 @@ export function App() {
       )}
       {modal === "token" && (
         <ModalShell title="输入管理口令" eyebrow="PRIVATE ACCESS" onClose={() => setModal(null)}>
-          <form className="token-form" onSubmit={(event) => { event.preventDefault(); const value = String(new FormData(event.currentTarget).get("token") || "").trim(); saveAdminToken(value); setModal(null); setToast(value ? "管理操作已解锁" : "已清除管理口令"); }}>
-            <span className="token-symbol"><KeyRound size={24} /></span><p>口令只保存在当前浏览器标签页中，用于新增、上传、编辑和删除。</p><label className="field"><span>管理口令</span><input name="token" type="password" autoFocus defaultValue={getAdminToken()} placeholder="输入服务器 ADMIN_TOKEN" /></label><div className="modal-actions"><button className="button button-ghost" type="button" onClick={() => { saveAdminToken(""); setModal(null); setToast("已清除管理口令"); }}>清除</button><button className="button button-primary" type="submit">保存并解锁</button></div>
+          <form className="token-form" onSubmit={saveAdminAccess}>
+            <span className="token-symbol"><KeyRound size={24} /></span><p>同一口令用于管理操作和查看影像；管理口令仍只保存在当前浏览器标签页中。</p>{adminError && <div className="form-error"><AlertCircle size={16} />{adminError}</div>}<label className="field"><span>管理口令</span><input name="token" type="password" autoFocus autoComplete="current-password" defaultValue={getAdminToken()} placeholder="输入服务器 ADMIN_TOKEN" /></label><div className="modal-actions"><button className="button button-ghost" type="button" onClick={() => { saveAdminToken(""); setModal(null); setToast("已清除管理口令"); }}>清除</button><button className="button button-primary" type="submit" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <KeyRound size={16} />}保存并解锁</button></div>
+          </form>
+        </ModalShell>
+      )}
+      {modal === "viewer" && (
+        <ModalShell title="登录查看影像" eyebrow="PRIVATE MEMORIES" onClose={() => setModal(null)}>
+          <form className="token-form" onSubmit={loginViewer}>
+            <span className="token-symbol"><LockKeyhole size={24} /></span><p>使用现有管理口令登录。服务器会创建一个 12 小时的安全观看会话，口令不会保存在页面中。</p>{viewerError && <div className="form-error"><AlertCircle size={16} />{viewerError}</div>}<label className="field"><span>访问口令</span><input name="token" type="password" autoFocus required autoComplete="current-password" placeholder="输入管理口令" /></label><div className="modal-actions"><button className="button button-ghost" type="button" onClick={() => setModal(null)}>取消</button><button className="button button-primary" type="submit" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <LockKeyhole size={16} />}登录并查看</button></div>
           </form>
         </ModalShell>
       )}

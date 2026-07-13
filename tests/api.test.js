@@ -12,6 +12,7 @@ describe("迹屿 API", () => {
   let tripId;
   let mediaId;
   let pngFixture;
+  let viewerAgent;
   const geocodeCalls = [];
 
   beforeAll(async () => {
@@ -24,6 +25,8 @@ describe("迹屿 API", () => {
       uploadDir: "uploads",
       thumbnailDir: "thumbnails",
       adminToken: "test-secret",
+      sessionSecret: "test-session-secret",
+      secureCookies: false,
       seedDemo: false,
       maxUploadMb: 5,
       geocodeSearch: async ({ query, countryCode }) => {
@@ -39,6 +42,7 @@ describe("迹屿 API", () => {
         }];
       },
     });
+    viewerAgent = request.agent(service.app);
   });
 
   afterAll(async () => {
@@ -49,6 +53,26 @@ describe("迹屿 API", () => {
   it("报告数据库和存储健康状态", async () => {
     const response = await request(service.app).get("/api/health").expect(200);
     expect(response.body).toEqual({ ok: true, database: "ready", storage: "ready" });
+  });
+
+  it("使用管理口令建立安全的影像观看会话", async () => {
+    const config = await request(service.app).get("/api/config").expect(200);
+    expect(config.body.viewerAuthEnabled).toBe(true);
+
+    const initial = await viewerAgent.get("/api/auth/session").expect(200);
+    expect(initial.body).toEqual({ viewerAuthEnabled: true, authenticated: false });
+    await viewerAgent.post("/api/auth/login").send({ token: "wrong-secret" }).expect(401);
+
+    const login = await viewerAgent.post("/api/auth/login").send({ token: "test-secret" }).expect(200);
+    expect(login.body).toEqual({ viewerAuthEnabled: true, authenticated: true });
+    const cookie = login.headers["set-cookie"].join("; ");
+    expect(cookie).toContain("jiyu_viewer_session=");
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("SameSite=Strict");
+    expect(cookie).toContain("Max-Age=43200");
+
+    const authenticated = await viewerAgent.get("/api/auth/session").expect(200);
+    expect(authenticated.body.authenticated).toBe(true);
   });
 
   it("按国家搜索城市并缓存地理编码结果", async () => {
@@ -115,20 +139,28 @@ describe("迹屿 API", () => {
     mediaId = upload.body.media.id;
     expect(upload.body.media).toMatchObject({ kind: "image", mimeType: "image/png", hasThumbnail: true });
 
-    const listing = await request(service.app).get(`/api/trips/${tripId}/media?page=1&limit=1`).expect(200);
+    await request(service.app).get(`/api/trips/${tripId}/media?page=1&limit=1`).expect(401);
+    const listing = await viewerAgent.get(`/api/trips/${tripId}/media?page=1&limit=1`).expect(200);
     expect(listing.body.total).toBe(1);
     expect(listing.body.media[0].id).toBe(mediaId);
 
-    const thumbnail = await request(service.app).get(`/api/media/${mediaId}/thumbnail`).expect(200);
+    await request(service.app).get(`/api/media/${mediaId}/thumbnail`).expect(401);
+    const thumbnail = await viewerAgent.get(`/api/media/${mediaId}/thumbnail`).expect(200);
     expect(thumbnail.headers["content-type"]).toContain("image/webp");
+    expect(thumbnail.headers["cache-control"]).toBe("private, no-store");
   });
 
   it("按原格式读取媒体并提供旅程 ZIP 下载", async () => {
-    const media = await request(service.app).get(`/api/media/${mediaId}/file`).expect(200);
+    await request(service.app).get(`/api/media/${mediaId}/file`).expect(401);
+    await request(service.app).get(`/api/media/${mediaId}/download`).expect(401);
+    await request(service.app).get(`/api/trips/${tripId}/download`).expect(401);
+
+    const media = await viewerAgent.get(`/api/media/${mediaId}/file`).expect(200);
     expect(media.headers["content-type"]).toContain("image/png");
     expect(Number(media.headers["content-length"])).toBe(pngFixture.length);
+    expect(media.headers["cache-control"]).toBe("private, no-store");
 
-    const archive = await request(service.app)
+    const archive = await viewerAgent
       .get(`/api/trips/${tripId}/download`)
       .buffer(true)
       .parse((response, callback) => {
@@ -143,8 +175,15 @@ describe("迹屿 API", () => {
 
   it("删除媒体时同时清理数据库记录", async () => {
     await request(service.app).delete(`/api/media/${mediaId}`).set("X-Admin-Token", "test-secret").expect(204);
-    await request(service.app).get(`/api/media/${mediaId}/file`).expect(404);
+    await viewerAgent.get(`/api/media/${mediaId}/file`).expect(404);
     const trips = await request(service.app).get("/api/trips").expect(200);
     expect(trips.body.trips[0].mediaCount).toBe(0);
+  });
+
+  it("退出后立即撤销影像访问", async () => {
+    const logout = await viewerAgent.post("/api/auth/logout").expect(200);
+    expect(logout.body).toEqual({ viewerAuthEnabled: true, authenticated: false });
+    expect(logout.headers["set-cookie"].join("; ")).toContain("Max-Age=0");
+    await viewerAgent.get(`/api/trips/${tripId}/media`).expect(401);
   });
 });

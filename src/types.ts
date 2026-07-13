@@ -41,6 +41,12 @@ export interface Totals {
 export interface AppConfig {
   maxUploadMb: number;
   writeProtected: boolean;
+  viewerAuthEnabled: boolean;
+}
+
+export interface ViewerSession {
+  viewerAuthEnabled: boolean;
+  authenticated: boolean;
 }
 
 export interface TripInput {

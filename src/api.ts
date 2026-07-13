@@ -1,4 +1,4 @@
-import type { AppConfig, LocationSuggestion, MediaItem, Totals, Trip, TripInput } from "./types";
+import type { AppConfig, LocationSuggestion, MediaItem, Totals, Trip, TripInput, ViewerSession } from "./types";
 
 const TOKEN_KEY = "jiyu-admin-token";
 
@@ -16,7 +16,7 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
   const token = getAdminToken();
   if (token) headers.set("X-Admin-Token", token);
-  const response = await fetch(url, { ...options, headers });
+  const response = await fetch(url, { credentials: "same-origin", ...options, headers });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ error: "请求失败" }));
     const error = new Error(payload.error || "请求失败") as Error & { status?: number };
@@ -29,6 +29,9 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
 
 export const api = {
   getConfig: () => request<AppConfig>("/api/config"),
+  getViewerSession: () => request<ViewerSession>("/api/auth/session"),
+  loginViewer: (token: string) => request<ViewerSession>("/api/auth/login", { method: "POST", body: JSON.stringify({ token }) }),
+  logoutViewer: () => request<ViewerSession>("/api/auth/logout", { method: "POST" }),
   getTrips: () => request<{ trips: Trip[]; totals: Totals }>("/api/trips"),
   searchCities: (countryCode: string, query: string, signal?: AbortSignal) => {
     const params = new URLSearchParams({ country: countryCode, q: query });

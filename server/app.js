@@ -5,10 +5,11 @@ import { fileTypeFromFile } from "file-type";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import multer from "multer";
 import sharp from "sharp";
 import { searchCities } from "./geocoding.js";
+import { createViewerAuth, safeTokenEqual } from "./viewer-auth.js";
 
 const DEFAULT_PAGE_SIZE = 18;
 const MAX_PAGE_SIZE = 48;
@@ -34,12 +35,6 @@ function ensureDirectory(directory) {
 function readBoolean(value, fallback = false) {
   if (value == null) return fallback;
   return String(value).toLowerCase() === "true";
-}
-
-function safeTokenEqual(received, expected) {
-  const left = Buffer.from(received || "");
-  const right = Buffer.from(expected || "");
-  return left.length === right.length && left.length > 0 && timingSafeEqual(left, right);
 }
 
 function mapTrip(row) {
@@ -186,6 +181,12 @@ export function createApp(options = {}) {
   const databasePath = options.databasePath || path.join(dataDir, "travelmap.db");
   const maxUploadMb = Number(options.maxUploadMb || process.env.MAX_UPLOAD_MB || 2048);
   const adminToken = options.adminToken ?? process.env.ADMIN_TOKEN ?? "";
+  const secureCookies = options.secureCookies ?? process.env.NODE_ENV === "production";
+  const viewerAuth = createViewerAuth({
+    accessToken: adminToken,
+    sessionSecret: options.sessionSecret ?? "",
+    secureCookies,
+  });
   const geocodeSearch = options.geocodeSearch || searchCities;
   const geocodeCache = new Map();
   const seedDemo = options.seedDemo ?? readBoolean(process.env.SEED_DEMO, process.env.NODE_ENV !== "production");
@@ -209,6 +210,13 @@ export function createApp(options = {}) {
     return res.status(401).json({ error: "管理口令不正确" });
   };
 
+  const requireViewer = (req, res, next) => {
+    res.setHeader("Vary", "Cookie");
+    if (viewerAuth.isAuthenticated(req.get("cookie"))) return next();
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.status(401).json({ error: "请先输入观看口令" });
+  };
+
   const storage = multer.diskStorage({
     destination(req, _file, callback) {
       const trip = db.prepare("SELECT id FROM trips WHERE id = ?").get(req.params.tripId);
@@ -228,7 +236,26 @@ export function createApp(options = {}) {
   });
 
   app.get("/api/config", (_req, res) => {
-    res.json({ maxUploadMb, writeProtected: Boolean(adminToken) });
+    res.json({ maxUploadMb, writeProtected: Boolean(adminToken), viewerAuthEnabled: viewerAuth.enabled });
+  });
+
+  app.get("/api/auth/session", (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ viewerAuthEnabled: viewerAuth.enabled, authenticated: viewerAuth.isAuthenticated(req.get("cookie")) });
+  });
+
+  app.post("/api/auth/login", (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    const token = String(req.body?.token || "").trim();
+    if (!viewerAuth.accepts(token)) return res.status(401).json({ error: "观看口令不正确" });
+    if (viewerAuth.enabled) res.setHeader("Set-Cookie", viewerAuth.issueCookie());
+    return res.json({ viewerAuthEnabled: viewerAuth.enabled, authenticated: true });
+  });
+
+  app.post("/api/auth/logout", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Set-Cookie", viewerAuth.clearCookie());
+    res.json({ viewerAuthEnabled: viewerAuth.enabled, authenticated: !viewerAuth.enabled });
   });
 
   app.get("/api/locations/search", async (req, res) => {
@@ -315,7 +342,7 @@ export function createApp(options = {}) {
     }
   });
 
-  app.get("/api/trips/:tripId/media", (req, res) => {
+  app.get("/api/trips/:tripId/media", requireViewer, (req, res) => {
     const trip = db.prepare("SELECT id FROM trips WHERE id = ?").get(req.params.tripId);
     if (!trip) return res.status(404).json({ error: "旅程不存在" });
     const page = Math.max(1, Number.parseInt(String(req.query.page || "1"), 10) || 1);
@@ -384,25 +411,25 @@ export function createApp(options = {}) {
     return media;
   }
 
-  app.get("/api/media/:mediaId/file", (req, res, next) => {
+  app.get("/api/media/:mediaId/file", requireViewer, (req, res, next) => {
     const media = findMedia(req, res);
     if (!media) return;
     res.type(media.mime_type);
-    res.setHeader("Cache-Control", "private, max-age=86400");
+    res.setHeader("Cache-Control", "private, no-store");
     res.setHeader("Accept-Ranges", "bytes");
     res.sendFile(path.join(uploadDir, media.trip_id, media.stored_name), (error) => error && next(error));
   });
 
-  app.get("/api/media/:mediaId/thumbnail", (req, res, next) => {
+  app.get("/api/media/:mediaId/thumbnail", requireViewer, (req, res, next) => {
     const media = findMedia(req, res);
     if (!media) return;
     if (!media.thumbnail_name) return res.status(404).json({ error: "该媒体没有缩略图" });
     res.type("image/webp");
-    res.setHeader("Cache-Control", "private, max-age=604800");
+    res.setHeader("Cache-Control", "private, no-store");
     res.sendFile(path.join(thumbnailDir, media.trip_id, media.thumbnail_name), (error) => error && next(error));
   });
 
-  app.get("/api/media/:mediaId/download", (req, res, next) => {
+  app.get("/api/media/:mediaId/download", requireViewer, (req, res, next) => {
     const media = findMedia(req, res);
     if (!media) return;
     res.download(path.join(uploadDir, media.trip_id, media.stored_name), media.original_name, (error) => error && next(error));
@@ -422,7 +449,7 @@ export function createApp(options = {}) {
     }
   });
 
-  app.get("/api/trips/:tripId/download", (req, res, next) => {
+  app.get("/api/trips/:tripId/download", requireViewer, (req, res, next) => {
     const trip = db.prepare("SELECT * FROM trips WHERE id = ?").get(req.params.tripId);
     if (!trip) return res.status(404).json({ error: "旅程不存在" });
     const media = db.prepare("SELECT * FROM media WHERE trip_id = ? ORDER BY created_at, id").all(req.params.tripId);
