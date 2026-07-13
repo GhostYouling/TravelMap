@@ -22,7 +22,8 @@ import {
 } from "lucide-react";
 import { api, getAdminToken, saveAdminToken, uploadMedia } from "./api";
 import { TravelGlobe } from "./components/TravelGlobe";
-import type { AppConfig, MediaItem, Totals, Trip, TripInput } from "./types";
+import { COUNTRIES, countryName, inferCityName, inferCountryCode } from "./locations";
+import type { AppConfig, LocationSuggestion, MediaItem, Totals, Trip, TripInput } from "./types";
 
 const EMPTY_TOTALS: Totals = { tripCount: 0, mediaCount: 0, totalBytes: 0 };
 const EMPTY_CONFIG: AppConfig = { maxUploadMb: 2048, writeProtected: false };
@@ -46,25 +47,32 @@ function formatDateRange(trip: Trip) {
 }
 
 function toTripInput(trip?: Trip): TripInput {
-  return trip
-    ? {
-        title: trip.title,
-        locationName: trip.locationName,
-        latitude: trip.latitude,
-        longitude: trip.longitude,
-        startDate: trip.startDate,
-        endDate: trip.endDate,
-        story: trip.story,
-      }
-    : {
-        title: "",
-        locationName: "",
-        latitude: 31.2304,
-        longitude: 121.4737,
-        startDate: new Date().toISOString().slice(0, 10),
-        endDate: null,
-        story: "",
-      };
+  if (trip) {
+    const inferredCountry = inferCountryCode(trip.locationName);
+    const inferredCity = inferCityName(trip.locationName);
+    return {
+      title: trip.title,
+      locationName: trip.locationName,
+      countryCode: trip.countryCode || inferredCountry,
+      cityName: trip.cityName || (inferredCountry ? inferredCity : null),
+      latitude: trip.latitude,
+      longitude: trip.longitude,
+      startDate: trip.startDate,
+      endDate: trip.endDate,
+      story: trip.story,
+    };
+  }
+  return {
+    title: "",
+    locationName: "",
+    countryCode: null,
+    cityName: null,
+    latitude: 0,
+    longitude: 0,
+    startDate: new Date().toISOString().slice(0, 10),
+    endDate: null,
+    story: "",
+  };
 }
 
 function ModalShell({ title, eyebrow, onClose, children, size = "normal" }: { title: string; eyebrow: string; onClose: () => void; children: React.ReactNode; size?: "normal" | "wide" }) {
@@ -83,15 +91,82 @@ function ModalShell({ title, eyebrow, onClose, children, size = "normal" }: { ti
 
 function TripForm({ initial, busy, onSubmit, onCancel }: { initial?: Trip; busy: boolean; onSubmit: (input: TripInput) => Promise<void>; onCancel: () => void }) {
   const [values, setValues] = useState<TripInput>(() => toTripInput(initial));
+  const [cityQuery, setCityQuery] = useState(() => initial?.cityName || inferCityName(initial?.locationName || "") || "");
+  const [cityResults, setCityResults] = useState<LocationSuggestion[]>([]);
+  const [cityStatus, setCityStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [cityOpen, setCityOpen] = useState(false);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    const query = cityQuery.trim();
+    if (!values.countryCode || query.length < 2 || query === values.cityName) {
+      setCityResults([]);
+      setCityStatus("idle");
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setCityStatus("loading");
+      api.searchCities(values.countryCode!, query, controller.signal)
+        .then(({ locations }) => {
+          setCityResults(locations);
+          setCityStatus("ready");
+          setCityOpen(true);
+        })
+        .catch((caught) => {
+          if (caught instanceof DOMException && caught.name === "AbortError") return;
+          setCityResults([]);
+          setCityStatus("error");
+          setCityOpen(true);
+        });
+    }, 350);
+
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [cityQuery, values.cityName, values.countryCode]);
 
   function update<K extends keyof TripInput>(key: K, value: TripInput[K]) {
     setValues((current) => ({ ...current, [key]: value }));
   }
 
+  function selectCountry(code: string) {
+    setCityQuery("");
+    setCityResults([]);
+    setCityStatus("idle");
+    setCityOpen(false);
+    setValues((current) => ({
+      ...current,
+      countryCode: code || null,
+      cityName: null,
+      locationName: "",
+    }));
+  }
+
+  function selectCity(city: LocationSuggestion) {
+    const selectedCountry = countryName(values.countryCode);
+    setValues((current) => ({
+      ...current,
+      cityName: city.name,
+      locationName: `${selectedCountry} · ${city.name}`,
+      latitude: Number(city.latitude.toFixed(6)),
+      longitude: Number(city.longitude.toFixed(6)),
+    }));
+    setCityQuery(city.name);
+    setCityResults([]);
+    setCityStatus("idle");
+    setCityOpen(false);
+  }
+
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError("");
+    if ((!initial || values.countryCode || values.cityName) && (!values.countryCode || !values.cityName)) {
+      setError("请先选择国家，并从搜索结果中选择城市");
+      return;
+    }
     try {
       await onSubmit(values);
     } catch (caught) {
@@ -103,10 +178,12 @@ function TripForm({ initial, busy, onSubmit, onCancel }: { initial?: Trip; busy:
     <form className="trip-form" onSubmit={submit}>
       {error && <div className="form-error"><AlertCircle size={16} />{error}</div>}
       <label className="field field-wide"><span>旅程名称</span><input name="title" required maxLength={80} value={values.title} onChange={(e) => update("title", e.target.value)} placeholder="例如：风吹过阿那亚" /></label>
-      <label className="field field-wide"><span>地点</span><input name="locationName" required maxLength={100} value={values.locationName} onChange={(e) => update("locationName", e.target.value)} placeholder="国家 / 城市 / 地标" /></label>
+      <label className="field"><span>国家 / 地区</span><select name="countryCode" required={!initial} value={values.countryCode || ""} onChange={(e) => selectCountry(e.target.value)}><option value="">请选择国家或地区</option>{COUNTRIES.map((country) => <option key={country.code} value={country.code}>{country.name}</option>)}</select></label>
+      <label className="field"><span>城市</span><div className="city-combobox"><input name="citySearch" required={!initial} value={cityQuery} disabled={!values.countryCode} autoComplete="off" role="combobox" aria-autocomplete="list" aria-expanded={cityOpen} aria-controls="city-results" onFocus={() => cityResults.length && setCityOpen(true)} onBlur={() => window.setTimeout(() => setCityOpen(false), 120)} onChange={(e) => { setCityQuery(e.target.value); update("cityName", null); setCityOpen(true); }} placeholder={values.countryCode ? "输入城市名搜索" : "请先选择国家"} />{cityStatus === "loading" && <LoaderCircle className="city-search-loader spin" size={16} />}{cityOpen && cityQuery.trim().length >= 2 && cityStatus !== "loading" && <div className="city-results" id="city-results" role="listbox">{cityResults.map((city) => <button key={city.id} type="button" role="option" aria-selected="false" onMouseDown={(event) => event.preventDefault()} onClick={() => selectCity(city)}><strong>{city.name}</strong><span>{[city.admin1, city.country].filter(Boolean).join(" · ")}</span><small>{city.latitude.toFixed(4)}, {city.longitude.toFixed(4)}</small></button>)}{cityStatus === "ready" && cityResults.length === 0 && <p>没有找到匹配城市，试试当地名称或英文名。</p>}{cityStatus === "error" && <p className="city-search-error">城市查询暂时不可用，请稍后重试。</p>}</div>}</div><small className="field-help">输入至少 2 个字符，再从结果中选择</small></label>
+      <label className="field field-wide"><span>地图显示地点</span><input name="locationName" required maxLength={100} value={values.locationName} onChange={(e) => update("locationName", e.target.value)} placeholder="选择城市后自动生成，也可以补充地区或地标" /></label>
       <label className="field"><span>纬度</span><input name="latitude" required type="number" step="0.0001" min="-90" max="90" value={values.latitude} onChange={(e) => update("latitude", Number(e.target.value))} /></label>
       <label className="field"><span>经度</span><input name="longitude" required type="number" step="0.0001" min="-180" max="180" value={values.longitude} onChange={(e) => update("longitude", Number(e.target.value))} /></label>
-      <p className="coordinate-note field-wide">可在地图应用里长按地点复制经纬度；纬度在前，经度在后。</p>
+      <p className="coordinate-note field-wide">选择城市后会自动填入经纬度；需要更精确到景点时仍可手动微调。城市数据由 <a href="https://open-meteo.com/" target="_blank" rel="noreferrer">Open-Meteo</a> 提供。</p>
       <label className="field"><span>出发日期</span><input name="startDate" required type="date" value={values.startDate} onChange={(e) => update("startDate", e.target.value)} /></label>
       <label className="field"><span>结束日期</span><input name="endDate" type="date" min={values.startDate} value={values.endDate || ""} onChange={(e) => update("endDate", e.target.value || null)} /></label>
       <label className="field field-wide"><span>旅行手记</span><textarea name="story" rows={5} maxLength={4000} value={values.story} onChange={(e) => update("story", e.target.value)} placeholder="风景、气味、某一句话，或者任何不想忘记的细节……" /></label>

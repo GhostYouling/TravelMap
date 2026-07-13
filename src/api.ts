@@ -1,4 +1,4 @@
-import type { AppConfig, MediaItem, Totals, Trip, TripInput } from "./types";
+import type { AppConfig, LocationSuggestion, MediaItem, Totals, Trip, TripInput } from "./types";
 
 const TOKEN_KEY = "jiyu-admin-token";
 
@@ -30,6 +30,10 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
 export const api = {
   getConfig: () => request<AppConfig>("/api/config"),
   getTrips: () => request<{ trips: Trip[]; totals: Totals }>("/api/trips"),
+  searchCities: (countryCode: string, query: string, signal?: AbortSignal) => {
+    const params = new URLSearchParams({ country: countryCode, q: query });
+    return request<{ locations: LocationSuggestion[] }>(`/api/locations/search?${params}`, { signal });
+  },
   createTrip: (trip: TripInput) => request<{ trip: Trip }>("/api/trips", { method: "POST", body: JSON.stringify(trip) }),
   updateTrip: (id: string, trip: TripInput) => request<{ trip: Trip }>(`/api/trips/${id}`, { method: "PATCH", body: JSON.stringify(trip) }),
   deleteTrip: (id: string) => request<void>(`/api/trips/${id}`, { method: "DELETE" }),

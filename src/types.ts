@@ -2,6 +2,8 @@ export interface Trip {
   id: string;
   title: string;
   locationName: string;
+  countryCode: string | null;
+  cityName: string | null;
   latitude: number;
   longitude: number;
   startDate: string;
@@ -44,9 +46,26 @@ export interface AppConfig {
 export interface TripInput {
   title: string;
   locationName: string;
+  countryCode: string | null;
+  cityName: string | null;
   latitude: number;
   longitude: number;
   startDate: string;
   endDate: string | null;
   story: string;
+}
+
+export interface CountryOption {
+  code: string;
+  name: string;
+}
+
+export interface LocationSuggestion {
+  id: string;
+  name: string;
+  country: string | null;
+  countryCode: string;
+  admin1: string | null;
+  latitude: number;
+  longitude: number;
 }

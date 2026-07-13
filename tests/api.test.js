@@ -12,6 +12,7 @@ describe("迹屿 API", () => {
   let tripId;
   let mediaId;
   let pngFixture;
+  const geocodeCalls = [];
 
   beforeAll(async () => {
     pngFixture = await sharp({ create: { width: 4, height: 4, channels: 4, background: "#ef704e" } }).png().toBuffer();
@@ -25,6 +26,18 @@ describe("迹屿 API", () => {
       adminToken: "test-secret",
       seedDemo: false,
       maxUploadMb: 5,
+      geocodeSearch: async ({ query, countryCode }) => {
+        geocodeCalls.push({ query, countryCode });
+        return [{
+          id: "1790645",
+          name: "上海",
+          country: "中国",
+          countryCode: "CN",
+          admin1: "上海",
+          latitude: 31.22222,
+          longitude: 121.45806,
+        }];
+      },
     });
   });
 
@@ -38,10 +51,24 @@ describe("迹屿 API", () => {
     expect(response.body).toEqual({ ok: true, database: "ready", storage: "ready" });
   });
 
+  it("按国家搜索城市并缓存地理编码结果", async () => {
+    const first = await request(service.app).get("/api/locations/search").query({ country: "cn", q: "上海" }).expect(200);
+    expect(first.body.locations[0]).toMatchObject({ name: "上海", countryCode: "CN", latitude: 31.22222, longitude: 121.45806 });
+
+    await request(service.app).get("/api/locations/search").query({ country: "CN", q: "上海" }).expect(200);
+    expect(geocodeCalls).toEqual([{ query: "上海", countryCode: "CN" }]);
+
+    const shortQuery = await request(service.app).get("/api/locations/search").query({ country: "CN", q: "上" }).expect(200);
+    expect(shortQuery.body.locations).toEqual([]);
+    await request(service.app).get("/api/locations/search").query({ country: "China", q: "上海" }).expect(400);
+  });
+
   it("保护写操作，并能创建一个合法旅程", async () => {
     const payload = {
       title: "海边的周末",
       locationName: "中国 · 厦门",
+      countryCode: "CN",
+      cityName: "厦门",
       latitude: 24.4798,
       longitude: 118.0894,
       startDate: "2026-04-03",
@@ -51,7 +78,20 @@ describe("迹屿 API", () => {
     await request(service.app).post("/api/trips").send(payload).expect(401);
     const response = await request(service.app).post("/api/trips").set("X-Admin-Token", "test-secret").send(payload).expect(201);
     tripId = response.body.trip.id;
-    expect(response.body.trip).toMatchObject({ title: payload.title, locationName: payload.locationName, mediaCount: 0 });
+    expect(response.body.trip).toMatchObject({ title: payload.title, locationName: payload.locationName, countryCode: "CN", cityName: "厦门", mediaCount: 0 });
+  });
+
+  it("拒绝只提交国家而未选择城市", async () => {
+    const response = await request(service.app).post("/api/trips").set("X-Admin-Token", "test-secret").send({
+      title: "未完成的地点",
+      locationName: "中国",
+      countryCode: "CN",
+      latitude: 31.2,
+      longitude: 121.4,
+      startDate: "2026-04-03",
+      story: "",
+    }).expect(400);
+    expect(response.body.error).toContain("同时选择");
   });
 
   it("拒绝非法坐标", async () => {

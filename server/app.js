@@ -8,6 +8,7 @@ import path from "node:path";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import multer from "multer";
 import sharp from "sharp";
+import { searchCities } from "./geocoding.js";
 
 const DEFAULT_PAGE_SIZE = 18;
 const MAX_PAGE_SIZE = 48;
@@ -46,6 +47,8 @@ function mapTrip(row) {
     id: row.id,
     title: row.title,
     locationName: row.location_name,
+    countryCode: row.country_code || null,
+    cityName: row.city_name || null,
     latitude: row.latitude,
     longitude: row.longitude,
     startDate: row.start_date,
@@ -86,6 +89,8 @@ function initializeDatabase(db, seedDemo) {
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       location_name TEXT NOT NULL,
+      country_code TEXT,
+      city_name TEXT,
       latitude REAL NOT NULL CHECK(latitude BETWEEN -90 AND 90),
       longitude REAL NOT NULL CHECK(longitude BETWEEN -180 AND 180),
       start_date TEXT NOT NULL,
@@ -110,16 +115,20 @@ function initializeDatabase(db, seedDemo) {
     CREATE INDEX IF NOT EXISTS media_trip_created_idx ON media(trip_id, created_at DESC, id DESC);
   `);
 
+  const tripColumns = new Set(db.pragma("table_info(trips)").map((column) => column.name));
+  if (!tripColumns.has("country_code")) db.exec("ALTER TABLE trips ADD COLUMN country_code TEXT");
+  if (!tripColumns.has("city_name")) db.exec("ALTER TABLE trips ADD COLUMN city_name TEXT");
+
   if (seedDemo && db.prepare("SELECT COUNT(*) AS count FROM trips").get().count === 0) {
     const now = new Date().toISOString();
     const insert = db.prepare(`
-      INSERT INTO trips (id, title, location_name, latitude, longitude, start_date, end_date, story, color, created_at, updated_at)
-      VALUES (@id, @title, @locationName, @latitude, @longitude, @startDate, @endDate, @story, @color, @createdAt, @updatedAt)
+      INSERT INTO trips (id, title, location_name, country_code, city_name, latitude, longitude, start_date, end_date, story, color, created_at, updated_at)
+      VALUES (@id, @title, @locationName, @countryCode, @cityName, @latitude, @longitude, @startDate, @endDate, @story, @color, @createdAt, @updatedAt)
     `);
     const demoTrips = [
-      { id: "demo-hokkaido", title: "雪落北海道", locationName: "日本 · 小樽", latitude: 43.1907, longitude: 140.9947, startDate: "2025-02-08", endDate: "2025-02-14", story: "海风穿过旧仓库，雪落在运河边。等你上传第一张照片，这段旅程就会真正亮起来。", color: COLORS[0] },
-      { id: "demo-yunnan", title: "山风与古城", locationName: "中国 · 云南大理", latitude: 25.6065, longitude: 100.2676, startDate: "2024-10-02", endDate: "2024-10-07", story: "沿着洱海慢慢走，把苍山的云和巷子里的黄昏留在这里。", color: COLORS[1] },
-      { id: "demo-iceland", title: "北纬六十四度", locationName: "冰岛 · 雷克雅未克", latitude: 64.1466, longitude: -21.9426, startDate: "2024-03-16", endDate: "2024-03-24", story: "黑沙滩、风和一场迟来的极光。地球转到这一边时，故事又被看见。", color: COLORS[2] },
+      { id: "demo-hokkaido", title: "雪落北海道", locationName: "日本 · 小樽", countryCode: "JP", cityName: "小樽", latitude: 43.1907, longitude: 140.9947, startDate: "2025-02-08", endDate: "2025-02-14", story: "海风穿过旧仓库，雪落在运河边。等你上传第一张照片，这段旅程就会真正亮起来。", color: COLORS[0] },
+      { id: "demo-yunnan", title: "山风与古城", locationName: "中国 · 云南大理", countryCode: "CN", cityName: "大理", latitude: 25.6065, longitude: 100.2676, startDate: "2024-10-02", endDate: "2024-10-07", story: "沿着洱海慢慢走，把苍山的云和巷子里的黄昏留在这里。", color: COLORS[1] },
+      { id: "demo-iceland", title: "北纬六十四度", locationName: "冰岛 · 雷克雅未克", countryCode: "IS", cityName: "雷克雅未克", latitude: 64.1466, longitude: -21.9426, startDate: "2024-03-16", endDate: "2024-03-24", story: "黑沙滩、风和一场迟来的极光。地球转到这一边时，故事又被看见。", color: COLORS[2] },
     ];
     const seed = db.transaction((trips) => trips.forEach((trip) => insert.run({ ...trip, createdAt: now, updatedAt: now })));
     seed(demoTrips);
@@ -148,6 +157,8 @@ function tripSelectSql(where = "") {
 function validateTrip(payload) {
   const title = String(payload.title || "").trim();
   const locationName = String(payload.locationName || "").trim();
+  const countryCode = payload.countryCode ? String(payload.countryCode).trim().toUpperCase() : null;
+  const cityName = payload.cityName ? String(payload.cityName).trim() : null;
   const latitude = Number(payload.latitude);
   const longitude = Number(payload.longitude);
   const startDate = String(payload.startDate || "").trim();
@@ -155,13 +166,16 @@ function validateTrip(payload) {
   const story = String(payload.story || "").trim();
   if (!title || title.length > 80) throw new Error("旅程名称应为 1–80 个字符");
   if (!locationName || locationName.length > 100) throw new Error("地点名称应为 1–100 个字符");
+  if (countryCode && !/^[A-Z]{2}$/.test(countryCode)) throw new Error("国家代码格式不正确");
+  if (cityName && cityName.length > 100) throw new Error("城市名称不能超过 100 个字符");
+  if (Boolean(countryCode) !== Boolean(cityName)) throw new Error("国家和城市需要同时选择");
   if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) throw new Error("纬度应在 -90 到 90 之间");
   if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) throw new Error("经度应在 -180 到 180 之间");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate)) throw new Error("请选择出发日期");
   if (endDate && !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) throw new Error("结束日期格式不正确");
   if (endDate && endDate < startDate) throw new Error("结束日期不能早于出发日期");
   if (story.length > 4000) throw new Error("旅行手记不能超过 4000 个字符");
-  return { title, locationName, latitude, longitude, startDate, endDate, story };
+  return { title, locationName, countryCode, cityName, latitude, longitude, startDate, endDate, story };
 }
 
 export function createApp(options = {}) {
@@ -172,6 +186,8 @@ export function createApp(options = {}) {
   const databasePath = options.databasePath || path.join(dataDir, "travelmap.db");
   const maxUploadMb = Number(options.maxUploadMb || process.env.MAX_UPLOAD_MB || 2048);
   const adminToken = options.adminToken ?? process.env.ADMIN_TOKEN ?? "";
+  const geocodeSearch = options.geocodeSearch || searchCities;
+  const geocodeCache = new Map();
   const seedDemo = options.seedDemo ?? readBoolean(process.env.SEED_DEMO, process.env.NODE_ENV !== "production");
 
   [dataDir, uploadDir, thumbnailDir].forEach(ensureDirectory);
@@ -215,6 +231,31 @@ export function createApp(options = {}) {
     res.json({ maxUploadMb, writeProtected: Boolean(adminToken) });
   });
 
+  app.get("/api/locations/search", async (req, res) => {
+    const query = String(req.query.q || "").trim();
+    const countryCode = String(req.query.country || "").trim().toUpperCase();
+    if (!/^[A-Z]{2}$/.test(countryCode)) return res.status(400).json({ error: "请先选择国家" });
+    if (query.length < 2) return res.json({ locations: [] });
+    if (query.length > 100) return res.status(400).json({ error: "城市关键词不能超过 100 个字符" });
+
+    const cacheKey = `${countryCode}:${query.toLocaleLowerCase("zh-CN")}`;
+    const cached = geocodeCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return res.json({ locations: cached.locations });
+
+    try {
+      const locations = await geocodeSearch({
+        query,
+        countryCode,
+        signal: AbortSignal.timeout(7000),
+      });
+      geocodeCache.set(cacheKey, { locations, expiresAt: Date.now() + 30 * 60 * 1000 });
+      if (geocodeCache.size > 200) geocodeCache.delete(geocodeCache.keys().next().value);
+      return res.json({ locations });
+    } catch {
+      return res.status(502).json({ error: "城市查询服务暂时不可用，请稍后重试" });
+    }
+  });
+
   app.get("/api/trips", (_req, res) => {
     const trips = db.prepare(`${tripSelectSql()} ORDER BY t.start_date DESC, t.created_at DESC`).all().map(mapTrip);
     const totals = db.prepare("SELECT COUNT(*) AS media_count, COALESCE(SUM(size), 0) AS total_bytes FROM media").get();
@@ -234,9 +275,9 @@ export function createApp(options = {}) {
       const now = new Date().toISOString();
       const color = COLORS[db.prepare("SELECT COUNT(*) AS count FROM trips").get().count % COLORS.length];
       db.prepare(`
-        INSERT INTO trips (id, title, location_name, latitude, longitude, start_date, end_date, story, color, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(id, trip.title, trip.locationName, trip.latitude, trip.longitude, trip.startDate, trip.endDate, trip.story, color, now, now);
+        INSERT INTO trips (id, title, location_name, country_code, city_name, latitude, longitude, start_date, end_date, story, color, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(id, trip.title, trip.locationName, trip.countryCode, trip.cityName, trip.latitude, trip.longitude, trip.startDate, trip.endDate, trip.story, color, now, now);
       const row = db.prepare(tripSelectSql("WHERE t.id = ?")).get(id);
       res.status(201).json({ trip: mapTrip(row) });
     } catch (error) {
@@ -250,9 +291,9 @@ export function createApp(options = {}) {
       if (!existing) return res.status(404).json({ error: "旅程不存在" });
       const trip = validateTrip(req.body);
       db.prepare(`
-        UPDATE trips SET title = ?, location_name = ?, latitude = ?, longitude = ?, start_date = ?, end_date = ?, story = ?, updated_at = ?
+        UPDATE trips SET title = ?, location_name = ?, country_code = ?, city_name = ?, latitude = ?, longitude = ?, start_date = ?, end_date = ?, story = ?, updated_at = ?
         WHERE id = ?
-      `).run(trip.title, trip.locationName, trip.latitude, trip.longitude, trip.startDate, trip.endDate, trip.story, new Date().toISOString(), req.params.tripId);
+      `).run(trip.title, trip.locationName, trip.countryCode, trip.cityName, trip.latitude, trip.longitude, trip.startDate, trip.endDate, trip.story, new Date().toISOString(), req.params.tripId);
       const row = db.prepare(tripSelectSql("WHERE t.id = ?")).get(req.params.tripId);
       res.json({ trip: mapTrip(row) });
     } catch (error) {
