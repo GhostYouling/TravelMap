@@ -1,0 +1,110 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import request from "supertest";
+import sharp from "sharp";
+import { createApp } from "../server/app.js";
+
+describe("迹屿 API", () => {
+  let directory;
+  let service;
+  let tripId;
+  let mediaId;
+  let pngFixture;
+
+  beforeAll(async () => {
+    pngFixture = await sharp({ create: { width: 4, height: 4, channels: 4, background: "#ef704e" } }).png().toBuffer();
+    directory = await fsp.mkdtemp(path.join(os.tmpdir(), "jiyu-test-"));
+    service = createApp({
+      cwd: directory,
+      databasePath: path.join(directory, "data", "test.db"),
+      dataDir: "data",
+      uploadDir: "uploads",
+      thumbnailDir: "thumbnails",
+      adminToken: "test-secret",
+      seedDemo: false,
+      maxUploadMb: 5,
+    });
+  });
+
+  afterAll(async () => {
+    service.close();
+    await fsp.rm(directory, { recursive: true, force: true });
+  });
+
+  it("报告数据库和存储健康状态", async () => {
+    const response = await request(service.app).get("/api/health").expect(200);
+    expect(response.body).toEqual({ ok: true, database: "ready", storage: "ready" });
+  });
+
+  it("保护写操作，并能创建一个合法旅程", async () => {
+    const payload = {
+      title: "海边的周末",
+      locationName: "中国 · 厦门",
+      latitude: 24.4798,
+      longitude: 118.0894,
+      startDate: "2026-04-03",
+      endDate: "2026-04-05",
+      story: "沿着海岸骑车。",
+    };
+    await request(service.app).post("/api/trips").send(payload).expect(401);
+    const response = await request(service.app).post("/api/trips").set("X-Admin-Token", "test-secret").send(payload).expect(201);
+    tripId = response.body.trip.id;
+    expect(response.body.trip).toMatchObject({ title: payload.title, locationName: payload.locationName, mediaCount: 0 });
+  });
+
+  it("拒绝非法坐标", async () => {
+    const response = await request(service.app).post("/api/trips").set("X-Admin-Token", "test-secret").send({
+      title: "错误坐标",
+      locationName: "未知",
+      latitude: 99,
+      longitude: 0,
+      startDate: "2026-04-03",
+      story: "",
+    }).expect(400);
+    expect(response.body.error).toContain("纬度");
+  });
+
+  it("流式接收图片、生成缩略图并分页返回元数据", async () => {
+    const upload = await request(service.app)
+      .post(`/api/trips/${tripId}/media`)
+      .set("X-Admin-Token", "test-secret")
+      .attach("file", pngFixture, { filename: "海边.png", contentType: "image/png" })
+      .expect(201);
+    mediaId = upload.body.media.id;
+    expect(upload.body.media).toMatchObject({ kind: "image", mimeType: "image/png", hasThumbnail: true });
+
+    const listing = await request(service.app).get(`/api/trips/${tripId}/media?page=1&limit=1`).expect(200);
+    expect(listing.body.total).toBe(1);
+    expect(listing.body.media[0].id).toBe(mediaId);
+
+    const thumbnail = await request(service.app).get(`/api/media/${mediaId}/thumbnail`).expect(200);
+    expect(thumbnail.headers["content-type"]).toContain("image/webp");
+  });
+
+  it("按原格式读取媒体并提供旅程 ZIP 下载", async () => {
+    const media = await request(service.app).get(`/api/media/${mediaId}/file`).expect(200);
+    expect(media.headers["content-type"]).toContain("image/png");
+    expect(Number(media.headers["content-length"])).toBe(pngFixture.length);
+
+    const archive = await request(service.app)
+      .get(`/api/trips/${tripId}/download`)
+      .buffer(true)
+      .parse((response, callback) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => callback(null, Buffer.concat(chunks)));
+      })
+      .expect(200);
+    expect(archive.headers["content-type"]).toContain("application/zip");
+    expect(archive.body.subarray(0, 2).toString()).toBe("PK");
+  });
+
+  it("删除媒体时同时清理数据库记录", async () => {
+    await request(service.app).delete(`/api/media/${mediaId}`).set("X-Admin-Token", "test-secret").expect(204);
+    await request(service.app).get(`/api/media/${mediaId}/file`).expect(404);
+    const trips = await request(service.app).get("/api/trips").expect(200);
+    expect(trips.body.trips[0].mediaCount).toBe(0);
+  });
+});

@@ -1,0 +1,11 @@
+node_modules/
+dist/
+data/
+uploads/
+thumbnails/
+.env
+.DS_Store
+*.log
+coverage/
+.vinext/
+.wrangler/
